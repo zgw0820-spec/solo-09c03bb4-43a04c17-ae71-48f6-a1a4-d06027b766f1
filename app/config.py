@@ -40,6 +40,11 @@ class Settings:
     statement_timeout_grace_ms: int = _int("STATEMENT_TIMEOUT_GRACE_MS", 1250)
     # Hard cap on the request body so an analyst cannot submit huge payloads.
     max_sql_chars: int = _int("MAX_SQL_CHARS", 10_000)
+    # Total budget of one /health readiness probe (connect-if-needed plus
+    # one read-only probe query on the dedicated probe connection).  The
+    # HTTP response is additionally bounded by short, constant cleanup
+    # grace periods after a probe timeout.
+    health_probe_timeout_ms: int = _int("HEALTH_PROBE_TIMEOUT_MS", 2000)
 
 
 settings = Settings()

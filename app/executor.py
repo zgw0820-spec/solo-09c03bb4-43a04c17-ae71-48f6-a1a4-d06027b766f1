@@ -32,6 +32,12 @@ from .pool import QueryConnectionPool
 
 logger = logging.getLogger("executor")
 
+# Bound on the client-side cancel request itself.  ``cancel_safe`` uses the
+# non-blocking libpq >= 17 cancellation API; a blocking ``PQcancel`` waits
+# for the server's reply while holding the GIL, which would wedge the whole
+# process when the server is unresponsive — exactly when cancels matter.
+_CANCEL_TIMEOUT_S = 2.0
+
 
 class QueryExecutor:
     def __init__(self, pool: QueryConnectionPool, settings: Settings) -> None:
@@ -139,11 +145,11 @@ class QueryExecutor:
             "server backstop" if backstop else "client deadline",
         )
 
-        # 1) libpq cancel request.  PQcancel opens a separate connection to
-        #    the server and is a blocking socket call; run it off the loop.
+        # 1) libpq cancel request, non-blocking and bounded so an
+        #    unresponsive server cannot freeze the event loop.
         cancel_ok = False
         try:
-            await asyncio.to_thread(conn.cancel)
+            await conn.cancel_safe(timeout=_CANCEL_TIMEOUT_S)
             cancel_ok = True
         except Exception:
             logger.exception("PQcancel failed; connection will be discarded")

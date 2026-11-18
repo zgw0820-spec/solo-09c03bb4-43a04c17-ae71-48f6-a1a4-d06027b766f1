@@ -24,6 +24,7 @@ services:
     environment:
       DATABASE_DSN: postgresql://fault_ro:fault_ro@db:5432/faultdb
       POOL_SIZE: "2"
+      HEALTH_PROBE_TIMEOUT_MS: "2000"
     ports:
       - "8000:8000"
 

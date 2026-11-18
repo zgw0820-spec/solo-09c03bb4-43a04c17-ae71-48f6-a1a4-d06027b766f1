@@ -13,6 +13,9 @@ Scenarios:
   5. after two concurrent slow queries, later requests still get their own
      results (connection reuse after confirmed rollback)
   6. pool capacity really is two (observed via pg_stat_activity)
+  7. /health stays healthy while both business connections are busy
+  8. concurrent /health checks share one dedicated probe connection
+  9. a probe connection killed out-of-band is rebuilt transparently
 """
 from __future__ import annotations
 
@@ -79,6 +82,10 @@ def run_case(title: str, fn) -> None:
 def case_health_and_basic() -> None:
     status, body = get("/health")
     check("健康检查 200", status == 200, body)
+    check("状态为 healthy", body["status"] == "healthy", body)
+    check("本次探测成功且为有界延迟",
+          body["probe"]["ok"] is True
+          and isinstance(body["probe"]["latency_ms"], (int, float)), body)
     check("连接池容量为 2", body["pool"]["size"] == 2, body)
     check("启动即建满两条连接", body["pool"]["idle"] == 2, body)
 
@@ -253,13 +260,120 @@ def case_capacity_and_reuse() -> None:
           and health["pool"]["total_discarded"] == discarded_before, health)
 
 
-def case_discard_and_rebuild() -> None:
-    """Kill a pooled backend out-of-band; the API must discard and rebuild."""
+def _admin_dsn() -> str | None:
     admin_dsn = os.environ.get("ADMIN_DSN")
     if not admin_dsn:
         dsn_file = os.path.join(tempfile.gettempdir(), "faultdb_admin_dsn")
         if os.path.exists(dsn_file):
             admin_dsn = open(dsn_file, encoding="utf-8").read().strip()
+    return admin_dsn or None
+
+
+def case_health_under_full_load() -> None:
+    """Both business connections busy, database fine -> still healthy."""
+    barrier = threading.Barrier(2)
+    outcomes: list = []
+
+    def slow(i: int) -> None:
+        barrier.wait()
+        outcomes.append(post(
+            "/query",
+            {"sql": f"SELECT {i}, pg_sleep(2)", "timeout_ms": 8000},
+            timeout=15,
+        ))
+
+    threads = [threading.Thread(target=slow, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)  # let both queries actually start on the backends
+
+    t0 = time.monotonic()
+    status, body = get("/health", timeout=10)
+    elapsed = time.monotonic() - t0
+    check("业务连接全忙时健康检查仍 200", status == 200, body)
+    check("状态为 healthy", body.get("status") == "healthy", body)
+    check("探测成功", body.get("probe", {}).get("ok") is True, body)
+    check("两条业务连接都在占用中", body["pool"]["in_use"] == 2, body)
+    check("探测未被业务查询阻塞 (<1.5s)", elapsed < 1.5,
+          f"elapsed={elapsed:.2f}")
+
+    for t in threads:
+        t.join()
+    check("占池慢查询自身不受影响",
+          all(s == 200 for s, _ in outcomes), outcomes)
+
+
+def case_concurrent_health_checks() -> None:
+    """Concurrent checks share at most one dedicated probe connection."""
+    barrier = threading.Barrier(6)
+    results: list = []
+
+    def hit() -> None:
+        barrier.wait()
+        results.append(get("/health", timeout=10))
+
+    threads = [threading.Thread(target=hit) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("6 个并发健康检查全部 200",
+          len(results) == 6 and all(s == 200 for s, _ in results), results)
+    check("并发结果均为 healthy",
+          all(b.get("status") == "healthy" for _, b in results), results)
+
+    admin_dsn = _admin_dsn()
+    if not admin_dsn:
+        print("  SKIP  探测连接数核对（未设置 ADMIN_DSN）")
+        return
+    try:
+        import psycopg
+    except ImportError:
+        print("  SKIP  探测连接数核对（无 psycopg）")
+        return
+    with psycopg.connect(admin_dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE application_name = 'health_probe'"
+        )
+        probe_backends = cur.fetchone()[0]
+    check("专用探测连接最多一条", probe_backends <= 1,
+          f"probe_backends={probe_backends}")
+
+
+def case_probe_backend_killed() -> None:
+    """Probe connection killed out-of-band -> next check rebuilds, still 200."""
+    admin_dsn = _admin_dsn()
+    if not admin_dsn:
+        print("  SKIP  探测连接被杀恢复测试（未设置 ADMIN_DSN）")
+        return
+    try:
+        import psycopg
+    except ImportError:
+        print("  SKIP  探测连接被杀恢复测试（无 psycopg）")
+        return
+
+    status, body = get("/health")
+    check("前置健康检查 200", status == 200, body)
+    with psycopg.connect(admin_dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE application_name = 'health_probe'"
+        )
+        killed = [r[0] for r in cur.fetchall()]
+    check("管理连接成功终止探测后端", killed and killed[0] is True, killed)
+
+    t0 = time.monotonic()
+    status, body = get("/health", timeout=10)
+    elapsed = time.monotonic() - t0
+    check("探测连接被杀后仍报健康(弃旧建新)",
+          status == 200 and body.get("status") == "healthy", body)
+    check("重建探测有界 (<2s)", elapsed < 2.0, f"elapsed={elapsed:.2f}")
+
+
+def case_discard_and_rebuild() -> None:
+    """Kill a pooled backend out-of-band; the API must discard and rebuild."""
+    admin_dsn = _admin_dsn()
     if not admin_dsn:
         print("  SKIP  弃置补建混沌测试（未设置 ADMIN_DSN）")
         return
@@ -270,12 +384,15 @@ def case_discard_and_rebuild() -> None:
         return
 
     with psycopg.connect(admin_dsn) as conn, conn.cursor() as cur:
+        # Exclude the dedicated health-probe connection: it lives outside
+        # the two-connection business pool by design.
         cur.execute(
             "SELECT pid FROM pg_stat_activity "
-            "WHERE usename = 'fault_ro' AND pid <> pg_backend_pid()"
+            "WHERE usename = 'fault_ro' AND pid <> pg_backend_pid() "
+            "AND application_name <> 'health_probe'"
         )
         pids = [r[0] for r in cur.fetchall()]
-        check("池内存在两条 fault_ro 后端", len(pids) == 2, pids)
+        check("池内存在两条 fault_ro 业务后端", len(pids) == 2, pids)
         victim = pids[0]
         cur.execute("SELECT pg_terminate_backend(%s)", (victim,))
         check("管理连接成功终止一个后端", cur.fetchone()[0] is True)
@@ -304,7 +421,9 @@ def case_discard_and_rebuild() -> None:
           health["pool"]["size"] == 2 and health["pool"]["idle"] == 2, health)
 
     # Physical capacity check: while two slow queries run, the database must
-    # see at most two fault_ro backends — no third connection is ever opened.
+    # see at most two fault_ro *business* backends — no third connection is
+    # ever opened for queries (the health probe is a separate, dedicated
+    # connection and is excluded here).
     observed: list[int] = []
     barrier = threading.Barrier(2)
 
@@ -321,13 +440,15 @@ def case_discard_and_rebuild() -> None:
     with psycopg.connect(admin_dsn) as conn, conn.cursor() as cur:
         while time.monotonic() < deadline:
             cur.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE usename='fault_ro'"
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE usename='fault_ro' "
+                "AND application_name <> 'health_probe'"
             )
             observed.append(cur.fetchone()[0])
             time.sleep(0.1)
     for t in threads:
         t.join()
-    check("数据库侧 fault_ro 后端数从未超过 2",
+    check("数据库侧 fault_ro 业务后端数从未超过 2",
           observed and max(observed) <= 2, f"max={max(observed)}")
 
 
@@ -339,6 +460,9 @@ def main() -> int:
     run_case("4. 排队期间过期不执行", case_queued_expiry)
     run_case("5. 容量为 2 与接续查询", case_capacity_and_reuse)
     run_case("6. 弃置并补建 / 物理容量", case_discard_and_rebuild)
+    run_case("7. 业务满载时健康检查仍报健康", case_health_under_full_load)
+    run_case("8. 并发健康检查共用一条探测连接", case_concurrent_health_checks)
+    run_case("9. 探测连接被杀后自动重建", case_probe_backend_killed)
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
 

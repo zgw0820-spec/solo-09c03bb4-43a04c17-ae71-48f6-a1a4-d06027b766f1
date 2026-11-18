@@ -14,8 +14,10 @@ COPY tests ./tests
 
 EXPOSE 8000
 
-# Container-level health check mirrors the application's pool status.
-HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"
+# Container-level health check mirrors the application's readiness probe.
+# /health now actively probes the database within a bounded budget, so the
+# client timeout must exceed the worst-case probe latency (~4s).
+HEALTHCHECK --interval=10s --timeout=8s --retries=5 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=6).status==200 else 1)"
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

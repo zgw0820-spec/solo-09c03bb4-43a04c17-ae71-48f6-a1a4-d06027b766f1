@@ -48,7 +48,18 @@ docker compose exec api python -m tests.selftest
 
 ### `GET /health`
 
-返回连接池容量、空闲/占用数、累计创建与弃置数。
+就绪检查（readiness）：**每次**调用都在有界时间内实测数据库能否执行
+只读查询（`SELECT 1`），而不是只看连接池计数——PostgreSQL 断连后池里
+两条失效连接仍会被计为 `idle=2`，仅凭计数会误报健康。
+
+| 场景 | HTTP | 回执要点 |
+| --- | --- | --- |
+| 探测成功 | 200 | `status=healthy`，`probe.latency_ms` 为本次实测延迟 |
+| 探测失败/超时 | 503 | `status=unhealthy`，`detail`/`probe.error` 给出原因 |
+
+回执同时携带连接池容量、空闲/占用数、累计创建与弃置数（`pool`）。
+探测预算由 `HEALTH_PROBE_TIMEOUT_MS` 控制（默认 2000ms；超时后的
+清理宽限也是有界常量）。
 
 ## 关键设计
 
@@ -70,7 +81,9 @@ docker compose exec api python -m tests.selftest
 ### 3. 超时处理协议（`app/executor.py`）
 
 1. 语句作为 **shielded task** 运行，超时回执一旦确定就不会被迟到结果覆盖。
-2. 截止时间到，调用 libpq `PQcancel`（经独立取消连接）请求服务器中止语句。
+2. 截止时间到，经 `cancel_safe()`（libpq ≥ 17 的非阻塞取消 API，自带
+   有界超时）请求服务器中止语句；阻塞式 `PQcancel` 在等待无响应服务器
+   时会持有 GIL，可能冻结整个进程，因此不使用。
 3. `await` 该 shielded 任务直至真正结束（收到 `QueryCanceled` 或拿到迟到
    结果），杜绝协程残留。
 4. 执行 `ROLLBACK` 并核对 `transaction_status == IDLE`，**确认事务结束**才
@@ -83,6 +96,21 @@ docker compose exec api python -m tests.selftest
 补建；只读语句在同一总预算内安全重试一次，客户端无感知。若补建暂时失败，
 池临时缩水并在下一次获取时懒建补回，不会死锁。
 
+### 5. 就绪探测（`app/health.py`）
+
+1. 探测使用一条**专用连接**（`application_name=health_probe`），独立于
+   两条业务连接：不占用业务后端、不对业务查询发取消；两条业务连接全忙
+   而数据库正常时照样报健康。
+2. 并发 `/health` 检查在一把锁上串行共用这条探测连接，任何时刻最多一条
+   专用探测连接。
+3. 每次检查的总预算为 `HEALTH_PROBE_TIMEOUT_MS`（含按需建连与一次
+   `SELECT 1`）；探测语句作为 shielded task 运行，超时即定 503，**迟到
+   结果只记日志、绝不改报健康**。
+4. 探测超时后对探测连接做有界清理（`cancel_safe` 取消 + 短宽限等待），
+   随后**关闭弃置**，不遗留半坏后端；下次检查懒建新连接。
+5. 常驻探测连接若已陈旧（断连期间被杀），在同一预算内弃旧建新重试一次，
+   因此数据库恢复后的第一次检查即可报健康。
+
 ## 无 Docker 的本地运行与自测
 
 本机若无容器运行时，可用 `pgserver`（PyPI 上的免 root PostgreSQL 16）：
@@ -90,16 +118,17 @@ docker compose exec api python -m tests.selftest
 ```bash
 pip install -r requirements.txt pgserver
 python tests/local_run.py        # 拉起 PG16 + uvicorn
-python -m tests.selftest         # 端到端自测（46 项）
+python -m tests.selftest         # 端到端自测（61 项）
 python tests/test_protocol.py    # 超时/迟到结果/排队协议直测（11 项）
+python tests/test_health.py      # 健康探测混沌测试：断连/满载/恢复（27 项）
 ```
 
 ## 目录结构
 
 ```
-app/            FastAPI 应用（config/pool/executor/validation/schemas/main）
+app/            FastAPI 应用（config/pool/executor/health/validation/schemas/main）
 db/01_init.sql  建表、预置日志、只读角色（Compose 首次初始化执行）
 tests/          selftest.py（HTTP 端到端）、test_protocol.py（协议直测）、
-                local_run.py（免 Docker 启动器）
+                test_health.py（健康探测混沌测试）、local_run.py（免 Docker 启动器）
 Dockerfile / docker-compose.yml / requirements.txt
 ```

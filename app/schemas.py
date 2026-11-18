@@ -45,5 +45,16 @@ class ErrorResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: Literal["healthy"]
-    pool: dict[str, Any]
+    status: Literal["healthy", "unhealthy"] = Field(
+        description=(
+            "healthy：本次探测确认数据库可在有界时间内执行只读查询；"
+            "unhealthy：探测失败（HTTP 503），detail 给出原因"
+        )
+    )
+    detail: str = Field(description="本次就绪探测的结论或失败原因")
+    probe: dict[str, Any] = Field(
+        description="专用探测连接本次检查的结果（ok/latency_ms/error）"
+    )
+    pool: dict[str, Any] = Field(
+        description="业务连接池计数（容量、空闲/占用、累计创建与弃置）"
+    )
